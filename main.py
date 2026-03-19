@@ -36,10 +36,17 @@ class VocuTTSPlugin(Star):
         super().__init__(context)
         self.config = config
         self.sessions: dict[str, SessionTTSConfig] = {}
+        self._http: aiohttp.ClientSession | None = None
 
     async def initialize(self) -> None:
         temp_dir = get_astrbot_temp_path()
         os.makedirs(temp_dir, exist_ok=True)
+        self._http = aiohttp.ClientSession()
+
+    async def _get_http(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession()
+        return self._http
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -158,37 +165,36 @@ class VocuTTSPlugin(Star):
         }
 
         try:
-            async with aiohttp.ClientSession() as http:
-                async with http.post(
-                    f"{base_url}/api/tts/simple-generate",
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error(f"VocuTTS: API returned {resp.status}: {body}")
-                        return None
-                    data = await resp.json()
-
-                audio_url = data.get("data", {}).get("audio")
-                if not audio_url:
-                    logger.error(f"VocuTTS: no audio URL in response: {data}")
+            http = await self._get_http()
+            async with http.post(
+                f"{base_url}/api/tts/simple-generate",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(f"VocuTTS: API returned {resp.status}: {body}")
                     return None
+                data = await resp.json()
 
-                return await self._download_audio(http, audio_url)
+            audio_url = data.get("data", {}).get("audio")
+            if not audio_url:
+                logger.error(f"VocuTTS: no audio URL in response: {data}")
+                return None
+
+            return await self._download_audio(audio_url)
         except Exception:
             logger.error("VocuTTS: voice generation failed", exc_info=True)
             return None
 
-    async def _download_audio(
-        self, http: aiohttp.ClientSession, url: str
-    ) -> str | None:
+    async def _download_audio(self, url: str) -> str | None:
         temp_dir = get_astrbot_temp_path()
         os.makedirs(temp_dir, exist_ok=True)
         path = os.path.join(temp_dir, f"vocutts_{uuid.uuid4()}.mp3")
 
         try:
+            http = await self._get_http()
             async with http.get(url) as resp:
                 if resp.status != 200:
                     logger.error(f"VocuTTS: audio download failed: {resp.status}")
@@ -212,16 +218,16 @@ class VocuTTSPlugin(Star):
         headers = {"Authorization": f"Bearer {api_key}"}
 
         try:
-            async with aiohttp.ClientSession() as http:
-                async with http.get(
-                    f"{base_url}/api/voice",
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json()
-                    return data.get("data", [])
+            http = await self._get_http()
+            async with http.get(
+                f"{base_url}/api/voice",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return data.get("data", [])
         except Exception:
             logger.error("VocuTTS: list voices failed", exc_info=True)
             return None
@@ -397,10 +403,17 @@ class VocuTTSPlugin(Star):
 
         try:
             chain = MessageChain(chain=[Comp.Record.fromFileSystem(audio_path)])
-            await self.context.send_message(umo, chain)
+            await event.send(chain)
         except Exception:
             logger.error("VocuTTS: failed to send voice message", exc_info=True)
+        finally:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
     async def terminate(self) -> None:
-        """Clean up temp files on plugin unload."""
         self.sessions.clear()
+        if self._http and not self._http.closed:
+            await self._http.close()
+            self._http = None
