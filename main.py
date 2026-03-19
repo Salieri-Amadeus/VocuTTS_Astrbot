@@ -22,6 +22,14 @@ _DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 _MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 _AUDIO_HOST_ALLOWLIST = {"storage.vocu.ai", "v1.vocu.ai"}
 _MAX_TTS_TEXT_LENGTH = 5000
+_AUDIO_CONTENT_TYPES = {
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/ogg",
+    "binary/octet-stream",
+    "application/octet-stream",
+}
 
 
 @dataclass
@@ -248,8 +256,12 @@ class VocuTTSPlugin(Star):
             logger.error(f"VocuTTS: refusing non-HTTP audio URL: {url}")
             return None
 
+        if not parsed.hostname:
+            logger.error(f"VocuTTS: audio URL has no hostname: {url}")
+            return None
+
         allowed_hosts = self._build_audio_host_allowlist()
-        if parsed.hostname and parsed.hostname not in allowed_hosts:
+        if parsed.hostname not in allowed_hosts:
             logger.error(
                 f"VocuTTS: audio host '{parsed.hostname}' not in allowlist {allowed_hosts}"
             )
@@ -268,6 +280,13 @@ class VocuTTSPlugin(Star):
                     logger.error(f"VocuTTS: audio download failed: {resp.status}")
                     return None
 
+                content_type = resp.content_type or ""
+                if content_type and content_type not in _AUDIO_CONTENT_TYPES:
+                    logger.error(
+                        f"VocuTTS: unexpected Content-Type '{content_type}', expected audio"
+                    )
+                    return None
+
                 downloaded = 0
                 with open(path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(8192):
@@ -280,20 +299,21 @@ class VocuTTSPlugin(Star):
                         f.write(chunk)
 
                 if downloaded > _MAX_DOWNLOAD_BYTES:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+                    self._try_remove(path)
                     return None
 
             return path
         except Exception:
             logger.error("VocuTTS: audio download failed", exc_info=True)
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            self._try_remove(path)
             return None
+
+    @staticmethod
+    def _try_remove(path: str) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     # ── list voices ──────────────────────────────────────────
 
@@ -313,7 +333,7 @@ class VocuTTSPlugin(Star):
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                if resp.status == 401 or resp.status == 403:
+                if resp.status in (401, 403):
                     return None, "API Key 认证失败，请检查 Key 是否正确。"
                 if resp.status != 200:
                     return None, f"Vocu API 返回错误 (HTTP {resp.status})。"
@@ -328,7 +348,7 @@ class VocuTTSPlugin(Star):
     # ── commands ──────────────────────────────────────────────
 
     @filter.command_group("vocutts")
-    def vocutts_group(self) -> None:
+    def vocutts_group(self, event: AstrMessageEvent) -> None:
         """VocuTTS 语音合成"""
 
     @vocutts_group.command("on")
@@ -385,22 +405,21 @@ class VocuTTSPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @vocutts_group.command("voice")
-    async def vocutts_voice(self, event: AstrMessageEvent):
+    async def vocutts_voice(self, event: AstrMessageEvent, voice_id: str = ""):
         """设置当前会话的声音角色: /vocutts voice <voice_id>"""
         event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
-        args = event.message_str.strip()
 
-        if not args:
+        if not voice_id:
             current = self._resolve_voice_id(session)
             yield event.plain_result(
                 f"当前 Voice ID: {current or '未设置'}\n用法: /vocutts voice <voice_id>"
             )
             return
 
-        session.voice_id = args
-        yield event.plain_result(f"已将当前会话的 Voice ID 设为: {args}")
+        session.voice_id = voice_id
+        yield event.plain_result(f"已将当前会话的 Voice ID 设为: {voice_id}")
 
     @vocutts_group.command("voices")
     async def vocutts_voices(self, event: AstrMessageEvent):
@@ -433,33 +452,31 @@ class VocuTTSPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @vocutts_group.command("style")
-    async def vocutts_style(self, event: AstrMessageEvent):
+    async def vocutts_style(self, event: AstrMessageEvent, style_id: str = ""):
         """设置当前会话的声音风格: /vocutts style <prompt_id>"""
         event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
-        args = event.message_str.strip()
 
-        if not args:
+        if not style_id:
             current = self._resolve_prompt_id(session)
             yield event.plain_result(
                 f"当前 Style ID: {current}\n用法: /vocutts style <prompt_id>"
             )
             return
 
-        session.prompt_id = args
-        yield event.plain_result(f"已将当前会话的 Style ID 设为: {args}")
+        session.prompt_id = style_id
+        yield event.plain_result(f"已将当前会话的 Style ID 设为: {style_id}")
 
     @vocutts_group.command("preset")
-    async def vocutts_preset(self, event: AstrMessageEvent):
+    async def vocutts_preset(self, event: AstrMessageEvent, preset_name: str = ""):
         """设置生成预设: /vocutts preset <creative|balance|stable>"""
         event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
-        args = event.message_str.strip()
         valid = {"creative", "balance", "stable"}
 
-        if not args or args not in valid:
+        if not preset_name or preset_name not in valid:
             current = self._resolve_preset(session)
             yield event.plain_result(
                 f"当前预设: {current}\n"
@@ -467,8 +484,8 @@ class VocuTTSPlugin(Star):
             )
             return
 
-        session.preset = args
-        yield event.plain_result(f"已将当前会话的预设设为: {args}")
+        session.preset = preset_name
+        yield event.plain_result(f"已将当前会话的预设设为: {preset_name}")
 
     # ── after_message_sent hook ──────────────────────────────
 
@@ -484,6 +501,7 @@ class VocuTTSPlugin(Star):
             return
 
         session.last_active = time.time()
+        self._cleanup_stale_sessions()
 
         result = event.get_result()
         if not result or not result.chain:
@@ -509,16 +527,14 @@ class VocuTTSPlugin(Star):
         if not audio_path:
             return
 
+        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         try:
             chain = MessageChain(chain=[Comp.Record.fromFileSystem(audio_path)])
             await event.send(chain)
         except Exception:
             logger.error("VocuTTS: failed to send voice message", exc_info=True)
         finally:
-            try:
-                os.remove(audio_path)
-            except OSError:
-                pass
+            self._try_remove(audio_path)
 
     async def terminate(self) -> None:
         self.sessions.clear()
