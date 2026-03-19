@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -13,6 +15,10 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+
+_VOCUTTS_SKIP_FLAG = "_vocutts_skip_tts"
+_SESSION_EXPIRE_SECONDS = 7 * 24 * 3600  # 7 days
+_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
 @dataclass
@@ -23,6 +29,7 @@ class SessionTTSConfig:
     voice_id: str | None = None
     prompt_id: str | None = None
     preset: str | None = None
+    last_active: float = field(default_factory=time.time)
 
 
 @register(
@@ -59,7 +66,19 @@ class VocuTTSPlugin(Star):
     def _get_session(self, umo: str) -> SessionTTSConfig:
         if umo not in self.sessions:
             self.sessions[umo] = SessionTTSConfig()
-        return self.sessions[umo]
+        session = self.sessions[umo]
+        session.last_active = time.time()
+        return session
+
+    def _cleanup_stale_sessions(self) -> None:
+        now = time.time()
+        stale = [
+            k
+            for k, v in self.sessions.items()
+            if now - v.last_active > _SESSION_EXPIRE_SECONDS
+        ]
+        for k in stale:
+            del self.sessions[k]
 
     def _resolve_voice_id(self, session: SessionTTSConfig) -> str:
         return session.voice_id or self._get_cfg("voice_id", "")
@@ -76,6 +95,7 @@ class VocuTTSPlugin(Star):
         """Process text according to bracket_mode config.
 
         Returns (spoken_text, emo_switch_or_none).
+        Empty spoken_text signals the caller to skip TTS entirely.
         """
         mode = self._get_cfg("bracket_mode", "strip")
         pattern = self._get_cfg(
@@ -86,12 +106,17 @@ class VocuTTSPlugin(Star):
         if mode == "keep":
             return text, None
 
-        brackets = re.findall(pattern, text)
-        spoken_text = re.sub(pattern, "", text)
+        try:
+            brackets = re.findall(pattern, text)
+            spoken_text = re.sub(pattern, "", text)
+        except re.error:
+            logger.warning(f"VocuTTS: invalid bracket_pattern regex: {pattern}")
+            return text, None
+
         spoken_text = re.sub(r"\s{2,}", " ", spoken_text).strip()
 
         if not spoken_text:
-            return text, None
+            return "", None
 
         if mode == "emotion_hint" and brackets:
             emo = self._extract_emotion(brackets)
@@ -106,19 +131,25 @@ class VocuTTSPlugin(Star):
 
         if isinstance(raw, str):
             try:
-                keyword_map: dict[str, list[int]] = json.loads(raw)
+                keyword_map = json.loads(raw)
             except json.JSONDecodeError:
                 logger.warning("VocuTTS: emotion_keywords JSON parse failed")
                 return None
         else:
             keyword_map = raw
 
+        if not isinstance(keyword_map, dict):
+            logger.warning(
+                f"VocuTTS: emotion_keywords must be a dict, got {type(keyword_map).__name__}"
+            )
+            return None
+
         combined = " ".join(brackets)
         # [Anger, Happiness, Neutral, Sadness, ContextualMatch]
         result = [0, 0, 0, 0, 0]
         matched = False
         for keyword, values in keyword_map.items():
-            if keyword in combined and len(values) == 5:
+            if isinstance(values, list) and len(values) == 5 and keyword in combined:
                 result = [max(r, v) for r, v in zip(result, values)]
                 matched = True
 
@@ -189,13 +220,18 @@ class VocuTTSPlugin(Star):
             return None
 
     async def _download_audio(self, url: str) -> str | None:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            logger.error(f"VocuTTS: refusing non-HTTP audio URL: {url}")
+            return None
+
         temp_dir = get_astrbot_temp_path()
         os.makedirs(temp_dir, exist_ok=True)
         path = os.path.join(temp_dir, f"vocutts_{uuid.uuid4()}.mp3")
 
         try:
             http = await self._get_http()
-            async with http.get(url) as resp:
+            async with http.get(url, timeout=_DOWNLOAD_TIMEOUT) as resp:
                 if resp.status != 200:
                     logger.error(f"VocuTTS: audio download failed: {resp.status}")
                     return None
@@ -241,6 +277,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("on")
     async def vocutts_on(self, event: AstrMessageEvent):
         """开启当前会话的 VocuTTS"""
+        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         session.enabled = True
@@ -263,6 +300,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("off")
     async def vocutts_off(self, event: AstrMessageEvent):
         """关闭当前会话的 VocuTTS"""
+        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         session.enabled = False
@@ -271,6 +309,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("status")
     async def vocutts_status(self, event: AstrMessageEvent):
         """查看当前会话 VocuTTS 状态"""
+        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         voice_id = self._resolve_voice_id(session)
@@ -291,6 +330,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("voice")
     async def vocutts_voice(self, event: AstrMessageEvent):
         """设置当前会话的声音角色: /vocutts voice <voice_id>"""
+        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         args = event.message_str.strip()
@@ -308,6 +348,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("voices")
     async def vocutts_voices(self, event: AstrMessageEvent):
         """列出所有可用的声音角色"""
+        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         voices = await self._list_voices()
         if voices is None:
             yield event.plain_result("获取声音列表失败，请检查 API Key 配置。")
@@ -337,6 +378,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("style")
     async def vocutts_style(self, event: AstrMessageEvent):
         """设置当前会话的声音风格: /vocutts style <prompt_id>"""
+        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         args = event.message_str.strip()
@@ -354,6 +396,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("preset")
     async def vocutts_preset(self, event: AstrMessageEvent):
         """设置生成预设: /vocutts preset <creative|balance|stable>"""
+        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         args = event.message_str.strip()
@@ -375,13 +418,23 @@ class VocuTTSPlugin(Star):
     @filter.after_message_sent()
     async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
         """Intercept sent messages and follow up with TTS voice."""
+        if event.get_extra(_VOCUTTS_SKIP_FLAG, False):
+            return
+
         umo = event.unified_msg_origin
         session = self.sessions.get(umo)
         if not session or not session.enabled:
             return
 
+        session.last_active = time.time()
+        self._cleanup_stale_sessions()
+
         result = event.get_result()
         if not result or not result.chain:
+            return
+
+        # Skip if the chain already contains audio
+        if any(isinstance(comp, Comp.Record) for comp in result.chain):
             return
 
         text_parts: list[str] = []
