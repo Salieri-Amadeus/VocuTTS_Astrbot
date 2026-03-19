@@ -19,6 +19,9 @@ from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 _VOCUTTS_SKIP_FLAG = "_vocutts_skip_tts"
 _SESSION_EXPIRE_SECONDS = 7 * 24 * 3600  # 7 days
 _DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+_AUDIO_HOST_ALLOWLIST = {"storage.vocu.ai", "v1.vocu.ai"}
+_MAX_TTS_TEXT_LENGTH = 5000
 
 
 @dataclass
@@ -68,6 +71,7 @@ class VocuTTSPlugin(Star):
             self.sessions[umo] = SessionTTSConfig()
         session = self.sessions[umo]
         session.last_active = time.time()
+        self._cleanup_stale_sessions()
         return session
 
     def _cleanup_stale_sessions(self) -> None:
@@ -88,6 +92,14 @@ class VocuTTSPlugin(Star):
 
     def _resolve_preset(self, session: SessionTTSConfig) -> str:
         return session.preset or self._get_cfg("preset", "balance")
+
+    def _build_audio_host_allowlist(self) -> set[str]:
+        base_url = self._get_cfg("api_base_url", "https://v1.vocu.ai")
+        parsed = urlparse(base_url)
+        hosts = set(_AUDIO_HOST_ALLOWLIST)
+        if parsed.hostname:
+            hosts.add(parsed.hostname)
+        return hosts
 
     # ── bracket processing ───────────────────────────────────
 
@@ -149,9 +161,17 @@ class VocuTTSPlugin(Star):
         result = [0, 0, 0, 0, 0]
         matched = False
         for keyword, values in keyword_map.items():
-            if isinstance(values, list) and len(values) == 5 and keyword in combined:
-                result = [max(r, v) for r, v in zip(result, values)]
-                matched = True
+            if not isinstance(keyword, str) or keyword not in combined:
+                continue
+            if not isinstance(values, list) or len(values) != 5:
+                continue
+            if not all(isinstance(v, int | float) for v in values):
+                logger.warning(
+                    f"VocuTTS: emotion value for '{keyword}' contains non-numeric elements, skipped"
+                )
+                continue
+            result = [max(r, int(v)) for r, v in zip(result, values)]
+            matched = True
 
         return result if matched else None
 
@@ -175,6 +195,9 @@ class VocuTTSPlugin(Star):
             return None
 
         base_url = self._get_cfg("api_base_url", "https://v1.vocu.ai").rstrip("/")
+
+        if len(text) > _MAX_TTS_TEXT_LENGTH:
+            text = text[:_MAX_TTS_TEXT_LENGTH]
 
         payload: dict = {
             "voiceId": voice_id,
@@ -225,30 +248,60 @@ class VocuTTSPlugin(Star):
             logger.error(f"VocuTTS: refusing non-HTTP audio URL: {url}")
             return None
 
+        allowed_hosts = self._build_audio_host_allowlist()
+        if parsed.hostname and parsed.hostname not in allowed_hosts:
+            logger.error(
+                f"VocuTTS: audio host '{parsed.hostname}' not in allowlist {allowed_hosts}"
+            )
+            return None
+
         temp_dir = get_astrbot_temp_path()
         os.makedirs(temp_dir, exist_ok=True)
         path = os.path.join(temp_dir, f"vocutts_{uuid.uuid4()}.mp3")
 
         try:
             http = await self._get_http()
-            async with http.get(url, timeout=_DOWNLOAD_TIMEOUT) as resp:
+            async with http.get(
+                url, timeout=_DOWNLOAD_TIMEOUT, allow_redirects=False
+            ) as resp:
                 if resp.status != 200:
                     logger.error(f"VocuTTS: audio download failed: {resp.status}")
                     return None
+
+                downloaded = 0
                 with open(path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(8192):
+                        downloaded += len(chunk)
+                        if downloaded > _MAX_DOWNLOAD_BYTES:
+                            logger.error(
+                                f"VocuTTS: audio exceeds {_MAX_DOWNLOAD_BYTES} bytes limit, aborted"
+                            )
+                            break
                         f.write(chunk)
+
+                if downloaded > _MAX_DOWNLOAD_BYTES:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                    return None
+
             return path
         except Exception:
             logger.error("VocuTTS: audio download failed", exc_info=True)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
             return None
 
     # ── list voices ──────────────────────────────────────────
 
-    async def _list_voices(self) -> list[dict] | None:
+    async def _list_voices(self) -> tuple[list[dict] | None, str]:
+        """Returns (voice_list, error_message). error_message is empty on success."""
         api_key = self._get_cfg("api_key", "")
         if not api_key:
-            return None
+            return None, "API Key 未配置，请在 WebUI 中设置。"
 
         base_url = self._get_cfg("api_base_url", "https://v1.vocu.ai").rstrip("/")
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -260,18 +313,22 @@ class VocuTTSPlugin(Star):
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
+                if resp.status == 401 or resp.status == 403:
+                    return None, "API Key 认证失败，请检查 Key 是否正确。"
                 if resp.status != 200:
-                    return None
+                    return None, f"Vocu API 返回错误 (HTTP {resp.status})。"
                 data = await resp.json()
-                return data.get("data", [])
+                return data.get("data", []), ""
+        except aiohttp.ClientError:
+            return None, "网络连接失败，请检查网络或 API 地址配置。"
         except Exception:
             logger.error("VocuTTS: list voices failed", exc_info=True)
-            return None
+            return None, "获取声音列表时发生未知错误。"
 
     # ── commands ──────────────────────────────────────────────
 
     @filter.command_group("vocutts")
-    def vocutts_group(self):
+    def vocutts_group(self) -> None:
         """VocuTTS 语音合成"""
 
     @vocutts_group.command("on")
@@ -349,9 +406,9 @@ class VocuTTSPlugin(Star):
     async def vocutts_voices(self, event: AstrMessageEvent):
         """列出所有可用的声音角色"""
         event.set_extra(_VOCUTTS_SKIP_FLAG, True)
-        voices = await self._list_voices()
+        voices, err = await self._list_voices()
         if voices is None:
-            yield event.plain_result("获取声音列表失败，请检查 API Key 配置。")
+            yield event.plain_result(err)
             return
 
         if not voices:
@@ -427,13 +484,11 @@ class VocuTTSPlugin(Star):
             return
 
         session.last_active = time.time()
-        self._cleanup_stale_sessions()
 
         result = event.get_result()
         if not result or not result.chain:
             return
 
-        # Skip if the chain already contains audio
         if any(isinstance(comp, Comp.Record) for comp in result.chain):
             return
 
