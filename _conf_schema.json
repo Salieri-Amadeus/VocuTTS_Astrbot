@@ -57,11 +57,6 @@
     "default": "strip",
     "options": ["strip", "emotion_hint", "keep"]
   },
-  "bracket_pattern": {
-    "description": "括号匹配正则表达式",
-    "type": "string",
-    "default": "[（(][^）)]*[）)]|[【\\[][^】\\]]*[】\\]]"
-  },
   "emotion_keywords": {
     "description": "情绪关键词映射（emotion_hint 模式下使用），格式为 JSON 对象，值为 [愤怒,开心,中性,悲伤,匹配上下文] 的 5 元素数组（0-10）",
     "type": "text",

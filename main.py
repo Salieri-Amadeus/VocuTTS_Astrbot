@@ -1,46 +1,15 @@
 from __future__ import annotations
 
-import json
-import os
-import re
 import time
-import uuid
-from dataclasses import dataclass, field
-from urllib.parse import urlparse
-
-import aiohttp
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
-_VOCUTTS_SKIP_FLAG = "_vocutts_skip_tts"
-_SESSION_EXPIRE_SECONDS = 7 * 24 * 3600  # 7 days
-_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
-_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
-_AUDIO_HOST_ALLOWLIST = {"storage.vocu.ai", "storage.vocustatic.com", "v1.vocu.ai"}
-_MAX_TTS_TEXT_LENGTH = 5000
-_AUDIO_CONTENT_TYPES = {
-    "audio/mpeg",
-    "audio/mp3",
-    "audio/wav",
-    "audio/ogg",
-    "binary/octet-stream",
-    "application/octet-stream",
-}
-
-
-@dataclass
-class SessionTTSConfig:
-    """Per-session TTS state and overrides."""
-
-    enabled: bool = False
-    voice_id: str | None = None
-    prompt_id: str | None = None
-    preset: str | None = None
-    last_active: float = field(default_factory=time.time)
+from .models import SESSION_EXPIRE_SECONDS, VOCUTTS_SKIP_FLAG, SessionTTSConfig
+from .text_processor import process_text
+from .vocu_client import VocuClient, try_remove_file
 
 
 @register(
@@ -54,17 +23,10 @@ class VocuTTSPlugin(Star):
         super().__init__(context)
         self.config = config
         self.sessions: dict[str, SessionTTSConfig] = {}
-        self._http: aiohttp.ClientSession | None = None
+        self._client = VocuClient()
 
     async def initialize(self) -> None:
-        temp_dir = get_astrbot_temp_path()
-        os.makedirs(temp_dir, exist_ok=True)
-        self._http = aiohttp.ClientSession()
-
-    async def _get_http(self) -> aiohttp.ClientSession:
-        if self._http is None or self._http.closed:
-            self._http = aiohttp.ClientSession()
-        return self._http
+        await self._client.ensure_session()
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -87,7 +49,7 @@ class VocuTTSPlugin(Star):
         stale = [
             k
             for k, v in self.sessions.items()
-            if now - v.last_active > _SESSION_EXPIRE_SECONDS
+            if now - v.last_active > SESSION_EXPIRE_SECONDS
         ]
         for k in stale:
             del self.sessions[k]
@@ -101,250 +63,6 @@ class VocuTTSPlugin(Star):
     def _resolve_preset(self, session: SessionTTSConfig) -> str:
         return session.preset or self._get_cfg("preset", "balance")
 
-    def _build_audio_host_allowlist(self) -> set[str]:
-        base_url = self._get_cfg("api_base_url", "https://v1.vocu.ai")
-        parsed = urlparse(base_url)
-        hosts = set(_AUDIO_HOST_ALLOWLIST)
-        if parsed.hostname:
-            hosts.add(parsed.hostname)
-        return hosts
-
-    # ── bracket processing ───────────────────────────────────
-
-    def _process_text(self, text: str) -> tuple[str, list[int] | None]:
-        """Process text according to bracket_mode config.
-
-        Returns (spoken_text, emo_switch_or_none).
-        Empty spoken_text signals the caller to skip TTS entirely.
-        """
-        mode = self._get_cfg("bracket_mode", "strip")
-        pattern = self._get_cfg(
-            "bracket_pattern",
-            r"[（(][^）)]*[）)]|[【\[][^】\]]*[】\]]",
-        )
-
-        if mode == "keep":
-            return text, None
-
-        try:
-            brackets = re.findall(pattern, text)
-            spoken_text = re.sub(pattern, "", text)
-        except re.error:
-            logger.warning(f"VocuTTS: invalid bracket_pattern regex: {pattern}")
-            return text, None
-
-        spoken_text = re.sub(r"\s{2,}", " ", spoken_text).strip()
-
-        if not spoken_text:
-            return "", None
-
-        if mode == "emotion_hint" and brackets:
-            emo = self._extract_emotion(brackets)
-            return spoken_text, emo
-
-        return spoken_text, None
-
-    def _extract_emotion(self, brackets: list[str]) -> list[int] | None:
-        raw = self._get_cfg("emotion_keywords", "")
-        if not raw:
-            return None
-
-        if isinstance(raw, str):
-            try:
-                keyword_map = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning("VocuTTS: emotion_keywords JSON parse failed")
-                return None
-        else:
-            keyword_map = raw
-
-        if not isinstance(keyword_map, dict):
-            logger.warning(
-                f"VocuTTS: emotion_keywords must be a dict, got {type(keyword_map).__name__}"
-            )
-            return None
-
-        combined = " ".join(brackets)
-        # [Anger, Happiness, Neutral, Sadness, ContextualMatch]
-        result = [0, 0, 0, 0, 0]
-        matched = False
-        for keyword, values in keyword_map.items():
-            if not isinstance(keyword, str) or keyword not in combined:
-                continue
-            if not isinstance(values, list) or len(values) != 5:
-                continue
-            if not all(isinstance(v, int | float) for v in values):
-                logger.warning(
-                    f"VocuTTS: emotion value for '{keyword}' contains non-numeric elements, skipped"
-                )
-                continue
-            result = [max(r, int(v)) for r, v in zip(result, values)]
-            matched = True
-
-        return result if matched else None
-
-    # ── vocu API ─────────────────────────────────────────────
-
-    async def _generate_voice(
-        self,
-        text: str,
-        session: SessionTTSConfig,
-        emo_switch: list[int] | None = None,
-    ) -> str | None:
-        """Call Vocu synchronous TTS API. Returns local file path or None."""
-        api_key = self._get_cfg("api_key", "")
-        if not api_key:
-            logger.warning("VocuTTS: api_key not configured")
-            return None
-
-        voice_id = self._resolve_voice_id(session)
-        if not voice_id:
-            logger.warning("VocuTTS: voice_id not configured")
-            return None
-
-        base_url = self._get_cfg("api_base_url", "https://v1.vocu.ai").rstrip("/")
-
-        if len(text) > _MAX_TTS_TEXT_LENGTH:
-            text = text[:_MAX_TTS_TEXT_LENGTH]
-
-        payload: dict = {
-            "voiceId": voice_id,
-            "text": text,
-            "promptId": self._resolve_prompt_id(session),
-            "preset": self._resolve_preset(session),
-            "break_clone": self._get_cfg("break_clone", True),
-            "language": self._get_cfg("language", "auto"),
-            "speechRate": self._get_cfg("speech_rate", 1.0),
-            "vivid": self._get_cfg("vivid", False),
-            "flash": self._get_cfg("flash", False),
-        }
-        if emo_switch:
-            payload["emo_switch"] = emo_switch
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        try:
-            http = await self._get_http()
-            async with http.post(
-                f"{base_url}/api/tts/simple-generate",
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error(f"VocuTTS: API returned {resp.status}: {body}")
-                    return None
-                data = await resp.json()
-
-            audio_url = data.get("data", {}).get("audio")
-            if not audio_url:
-                logger.error(f"VocuTTS: no audio URL in response: {data}")
-                return None
-
-            return await self._download_audio(audio_url)
-        except Exception:
-            logger.error("VocuTTS: voice generation failed", exc_info=True)
-            return None
-
-    async def _download_audio(self, url: str) -> str | None:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            logger.error(f"VocuTTS: refusing non-HTTP audio URL: {url}")
-            return None
-
-        if not parsed.hostname:
-            logger.error(f"VocuTTS: audio URL has no hostname: {url}")
-            return None
-
-        allowed_hosts = self._build_audio_host_allowlist()
-        if parsed.hostname not in allowed_hosts:
-            logger.error(
-                f"VocuTTS: audio host '{parsed.hostname}' not in allowlist {allowed_hosts}"
-            )
-            return None
-
-        temp_dir = get_astrbot_temp_path()
-        os.makedirs(temp_dir, exist_ok=True)
-        path = os.path.join(temp_dir, f"vocutts_{uuid.uuid4()}.mp3")
-
-        try:
-            http = await self._get_http()
-            async with http.get(
-                url, timeout=_DOWNLOAD_TIMEOUT, allow_redirects=False
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"VocuTTS: audio download failed: {resp.status}")
-                    return None
-
-                content_type = resp.content_type or ""
-                if content_type and content_type not in _AUDIO_CONTENT_TYPES:
-                    logger.error(
-                        f"VocuTTS: unexpected Content-Type '{content_type}', expected audio"
-                    )
-                    return None
-
-                downloaded = 0
-                with open(path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(8192):
-                        downloaded += len(chunk)
-                        if downloaded > _MAX_DOWNLOAD_BYTES:
-                            logger.error(
-                                f"VocuTTS: audio exceeds {_MAX_DOWNLOAD_BYTES} bytes limit, aborted"
-                            )
-                            break
-                        f.write(chunk)
-
-                if downloaded > _MAX_DOWNLOAD_BYTES:
-                    self._try_remove(path)
-                    return None
-
-            return path
-        except Exception:
-            logger.error("VocuTTS: audio download failed", exc_info=True)
-            self._try_remove(path)
-            return None
-
-    @staticmethod
-    def _try_remove(path: str) -> None:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-    # ── list voices ──────────────────────────────────────────
-
-    async def _list_voices(self) -> tuple[list[dict] | None, str]:
-        """Returns (voice_list, error_message). error_message is empty on success."""
-        api_key = self._get_cfg("api_key", "")
-        if not api_key:
-            return None, "API Key 未配置，请在 WebUI 中设置。"
-
-        base_url = self._get_cfg("api_base_url", "https://v1.vocu.ai").rstrip("/")
-        headers = {"Authorization": f"Bearer {api_key}"}
-
-        try:
-            http = await self._get_http()
-            async with http.get(
-                f"{base_url}/api/voice",
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status in (401, 403):
-                    return None, "API Key 认证失败，请检查 Key 是否正确。"
-                if resp.status != 200:
-                    return None, f"Vocu API 返回错误 (HTTP {resp.status})。"
-                data = await resp.json()
-                return data.get("data", []), ""
-        except aiohttp.ClientError:
-            return None, "网络连接失败，请检查网络或 API 地址配置。"
-        except Exception:
-            logger.error("VocuTTS: list voices failed", exc_info=True)
-            return None, "获取声音列表时发生未知错误。"
-
     # ── commands ──────────────────────────────────────────────
 
     @filter.command_group("vocutts")
@@ -354,7 +72,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("on")
     async def vocutts_on(self, event: AstrMessageEvent):
         """开启当前会话的 VocuTTS"""
-        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
+        event.set_extra(VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         session.enabled = True
@@ -377,7 +95,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("off")
     async def vocutts_off(self, event: AstrMessageEvent):
         """关闭当前会话的 VocuTTS"""
-        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
+        event.set_extra(VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         session.enabled = False
@@ -386,7 +104,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("status")
     async def vocutts_status(self, event: AstrMessageEvent):
         """查看当前会话 VocuTTS 状态"""
-        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
+        event.set_extra(VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         voice_id = self._resolve_voice_id(session)
@@ -407,7 +125,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("voice")
     async def vocutts_voice(self, event: AstrMessageEvent, voice_id: str = ""):
         """设置当前会话的声音角色: /vocutts voice <voice_id>"""
-        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
+        event.set_extra(VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
 
@@ -424,8 +142,16 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("voices")
     async def vocutts_voices(self, event: AstrMessageEvent):
         """列出所有可用的声音角色"""
-        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
-        voices, err = await self._list_voices()
+        event.set_extra(VOCUTTS_SKIP_FLAG, True)
+        api_key = self._get_cfg("api_key", "")
+        if not api_key:
+            yield event.plain_result("API Key 未配置，请在 WebUI 中设置。")
+            return
+
+        base_url = self._get_cfg("api_base_url", "https://v1.vocu.ai")
+        voices, err = await self._client.list_voices(
+            api_key=api_key, api_base_url=base_url
+        )
         if voices is None:
             yield event.plain_result(err)
             return
@@ -454,7 +180,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("style")
     async def vocutts_style(self, event: AstrMessageEvent, style_id: str = ""):
         """设置当前会话的声音风格: /vocutts style <prompt_id>"""
-        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
+        event.set_extra(VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
 
@@ -471,7 +197,7 @@ class VocuTTSPlugin(Star):
     @vocutts_group.command("preset")
     async def vocutts_preset(self, event: AstrMessageEvent, preset_name: str = ""):
         """设置生成预设: /vocutts preset <creative|balance|stable>"""
-        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
+        event.set_extra(VOCUTTS_SKIP_FLAG, True)
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         valid = {"creative", "balance", "stable"}
@@ -492,7 +218,7 @@ class VocuTTSPlugin(Star):
     @filter.after_message_sent()
     async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
         """Intercept sent messages and follow up with TTS voice."""
-        if event.get_extra(_VOCUTTS_SKIP_FLAG, False):
+        if event.get_extra(VOCUTTS_SKIP_FLAG, False):
             return
 
         umo = event.unified_msg_origin
@@ -519,25 +245,45 @@ class VocuTTSPlugin(Star):
         if not full_text:
             return
 
-        spoken_text, emo_switch = self._process_text(full_text)
+        spoken_text, emo_switch = process_text(
+            full_text,
+            mode=self._get_cfg("bracket_mode", "strip"),
+            emotion_keywords=self._get_cfg("emotion_keywords", ""),
+        )
         if not spoken_text:
             return
 
-        audio_path = await self._generate_voice(spoken_text, session, emo_switch)
+        api_key = self._get_cfg("api_key", "")
+        voice_id = self._resolve_voice_id(session)
+        if not api_key or not voice_id:
+            return
+
+        audio_path = await self._client.generate_voice(
+            spoken_text,
+            api_key=api_key,
+            voice_id=voice_id,
+            prompt_id=self._resolve_prompt_id(session),
+            preset=self._resolve_preset(session),
+            api_base_url=self._get_cfg("api_base_url", "https://v1.vocu.ai"),
+            break_clone=self._get_cfg("break_clone", True),
+            language=self._get_cfg("language", "auto"),
+            speech_rate=self._get_cfg("speech_rate", 1.0),
+            vivid=self._get_cfg("vivid", False),
+            flash=self._get_cfg("flash", False),
+            emo_switch=emo_switch,
+        )
         if not audio_path:
             return
 
-        event.set_extra(_VOCUTTS_SKIP_FLAG, True)
+        event.set_extra(VOCUTTS_SKIP_FLAG, True)
         try:
             chain = MessageChain(chain=[Comp.Record.fromFileSystem(audio_path)])
             await event.send(chain)
         except Exception:
             logger.error("VocuTTS: failed to send voice message", exc_info=True)
         finally:
-            self._try_remove(audio_path)
+            try_remove_file(audio_path)
 
     async def terminate(self) -> None:
         self.sessions.clear()
-        if self._http and not self._http.closed:
-            await self._http.close()
-            self._http = None
+        await self._client.close()
