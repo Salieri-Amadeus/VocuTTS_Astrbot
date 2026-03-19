@@ -20,7 +20,7 @@ _VOCUTTS_SKIP_FLAG = "_vocutts_skip_tts"
 _SESSION_EXPIRE_SECONDS = 7 * 24 * 3600  # 7 days
 _DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 _MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
-_AUDIO_HOST_ALLOWLIST = {"storage.vocu.ai", "v1.vocu.ai"}
+_AUDIO_HOST_ALLOWLIST = {"storage.vocu.ai", "storage.vocustatic.com", "v1.vocu.ai"}
 _MAX_TTS_TEXT_LENGTH = 5000
 _AUDIO_CONTENT_TYPES = {
     "audio/mpeg",
