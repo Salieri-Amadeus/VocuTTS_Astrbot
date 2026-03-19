@@ -1,0 +1,70 @@
+{
+  "api_key": {
+    "description": "Vocu API Key（在 https://app.vocu.ai/apiKey 创建）",
+    "type": "string",
+    "default": ""
+  },
+  "api_base_url": {
+    "description": "Vocu API 基础 URL",
+    "type": "string",
+    "default": "https://v1.vocu.ai"
+  },
+  "voice_id": {
+    "description": "默认 Voice Character ID（在 Vocu 控制台查看）",
+    "type": "string",
+    "default": ""
+  },
+  "prompt_id": {
+    "description": "Voice Character 风格 ID（默认为 default）",
+    "type": "string",
+    "default": "default"
+  },
+  "preset": {
+    "description": "生成预设策略",
+    "type": "string",
+    "default": "balance",
+    "options": ["creative", "balance", "stable"]
+  },
+  "language": {
+    "description": "语音语言（auto 为自动识别，粤语需手动指定 yue）",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "zh", "en", "ja", "ko", "fr", "es", "de", "pt", "yue"]
+  },
+  "speech_rate": {
+    "description": "语速控制（0.5-2.0，1.0 为正常速度）",
+    "type": "float",
+    "default": 1.0
+  },
+  "vivid": {
+    "description": "活泼表达模式（V3.0 角色，增强情感表现力，可能降低稳定性）",
+    "type": "bool",
+    "default": false
+  },
+  "break_clone": {
+    "description": "情绪偏向文本（让 Vocu 根据文本语境自动推断情绪）",
+    "type": "bool",
+    "default": true
+  },
+  "flash": {
+    "description": "低延迟模式（牺牲部分质量换取更快生成速度）",
+    "type": "bool",
+    "default": false
+  },
+  "bracket_mode": {
+    "description": "括号内容处理方式：strip=移除不朗读，emotion_hint=移除但提取情绪，keep=保留朗读",
+    "type": "string",
+    "default": "strip",
+    "options": ["strip", "emotion_hint", "keep"]
+  },
+  "bracket_pattern": {
+    "description": "括号匹配正则表达式",
+    "type": "string",
+    "default": "[（(][^）)]*[）)]|[【\\[][^】\\]]*[】\\]]"
+  },
+  "emotion_keywords": {
+    "description": "情绪关键词映射（emotion_hint 模式下使用），格式为 JSON 对象，值为 [愤怒,开心,中性,悲伤,匹配上下文] 的 5 元素数组（0-10）",
+    "type": "text",
+    "default": "{\"愤怒\":[8,0,0,0,0],\"生气\":[8,0,0,0,0],\"怒\":[6,0,0,0,0],\"开心\":[0,8,0,0,0],\"高兴\":[0,8,0,0,0],\"微笑\":[0,5,0,0,0],\"笑\":[0,6,0,0,0],\"悲伤\":[0,0,0,8,0],\"难过\":[0,0,0,7,0],\"哭\":[0,0,0,8,0],\"平静\":[0,0,8,0,0],\"冷漠\":[0,0,7,0,0],\"温柔\":[0,3,3,0,0],\"紧张\":[3,0,0,3,0],\"害怕\":[2,0,0,5,0],\"惊讶\":[2,3,0,0,0]}"
+  }
+}
