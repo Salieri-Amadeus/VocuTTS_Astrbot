@@ -20,18 +20,37 @@ def process_text(
     Empty spoken_text signals the caller to skip TTS entirely.
     """
     if mode == "keep":
+        logger.debug(
+            "VocuTTS: text_processor mode=keep, passthrough (%d chars)", len(text)
+        )
         return text, None
 
     spoken_text, brackets = _strip_brackets(text)
     spoken_text = re.sub(r"\s{2,}", " ", spoken_text).strip()
 
     if not spoken_text:
+        logger.debug(
+            "VocuTTS: text_processor produced empty spoken text (brackets=%d)",
+            len(brackets),
+        )
         return "", None
 
     if mode == "emotion_hint" and brackets:
         emo = _extract_emotion(brackets, emotion_keywords)
+        logger.debug(
+            "VocuTTS: text_processor mode=emotion_hint, spoken=%d chars, brackets=%d, emo=%s",
+            len(spoken_text),
+            len(brackets),
+            emo,
+        )
         return spoken_text, emo
 
+    logger.debug(
+        "VocuTTS: text_processor mode=%s, spoken=%d chars, stripped %d bracket groups",
+        mode,
+        len(spoken_text),
+        len(brackets),
+    )
     return spoken_text, None
 
 

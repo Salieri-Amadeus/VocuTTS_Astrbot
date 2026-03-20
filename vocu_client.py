@@ -61,6 +61,11 @@ class VocuClient:
         base_url = api_base_url.rstrip("/")
 
         if len(text) > MAX_TTS_TEXT_LENGTH:
+            logger.warning(
+                "VocuTTS: text truncated from %d to %d chars",
+                len(text),
+                MAX_TTS_TEXT_LENGTH,
+            )
             text = text[:MAX_TTS_TEXT_LENGTH]
 
         payload: dict = {
@@ -83,6 +88,13 @@ class VocuClient:
         }
 
         try:
+            logger.debug(
+                "VocuTTS: calling API (voice=%s, prompt=%s, preset=%s, text=%d chars)",
+                voice_id,
+                prompt_id,
+                preset,
+                len(text),
+            )
             http = await self.ensure_session()
             async with http.post(
                 f"{base_url}/api/tts/simple-generate",
@@ -92,15 +104,16 @@ class VocuClient:
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    logger.error(f"VocuTTS: API returned {resp.status}: {body}")
+                    logger.error("VocuTTS: API returned %d: %s", resp.status, body)
                     return None
                 data = await resp.json()
 
             audio_url = data.get("data", {}).get("audio")
             if not audio_url:
-                logger.error(f"VocuTTS: no audio URL in response: {data}")
+                logger.error("VocuTTS: no audio URL in response: %s", data)
                 return None
 
+            logger.debug("VocuTTS: API returned audio URL, downloading")
             return await self._download_audio(audio_url, api_base_url)
         except Exception:
             logger.error("VocuTTS: voice generation failed", exc_info=True)
@@ -158,6 +171,7 @@ class VocuClient:
                     try_remove_file(path)
                     return None
 
+            logger.debug("VocuTTS: audio downloaded (%d bytes) -> %s", downloaded, path)
             return path
         except Exception:
             logger.error("VocuTTS: audio download failed", exc_info=True)
@@ -172,6 +186,7 @@ class VocuClient:
         headers = {"Authorization": f"Bearer {api_key}"}
 
         try:
+            logger.debug("VocuTTS: fetching voice list from %s", base_url)
             http = await self.ensure_session()
             async with http.get(
                 f"{base_url}/api/voice",
@@ -179,12 +194,19 @@ class VocuClient:
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status in (401, 403):
+                    logger.warning(
+                        "VocuTTS: voice list auth failed (HTTP %d)", resp.status
+                    )
                     return None, "API Key 认证失败，请检查 Key 是否正确。"
                 if resp.status != 200:
+                    logger.error("VocuTTS: voice list API returned %d", resp.status)
                     return None, f"Vocu API 返回错误 (HTTP {resp.status})。"
                 data = await resp.json()
-                return data.get("data", []), ""
+                voices = data.get("data", [])
+                logger.info("VocuTTS: fetched %d voices", len(voices))
+                return voices, ""
         except aiohttp.ClientError:
+            logger.warning("VocuTTS: voice list network error", exc_info=True)
             return None, "网络连接失败，请检查网络或 API 地址配置。"
         except Exception:
             logger.error("VocuTTS: list voices failed", exc_info=True)

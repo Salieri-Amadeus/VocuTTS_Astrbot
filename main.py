@@ -26,7 +26,9 @@ class VocuTTSPlugin(Star):
         self._client = VocuClient()
 
     async def initialize(self) -> None:
+        logger.info("VocuTTS: initializing plugin")
         await self._client.ensure_session()
+        logger.info("VocuTTS: plugin ready")
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -87,6 +89,11 @@ class VocuTTSPlugin(Star):
                 "Voice ID 未配置，请在 WebUI 中设置或使用 /vocutts voice <id>"
             )
 
+        if warnings:
+            logger.warning("VocuTTS: enabled for %s with warnings: %s", umo, warnings)
+        else:
+            logger.info("VocuTTS: enabled for %s (voice=%s)", umo, voice_id)
+
         msg = "VocuTTS 已开启。"
         if warnings:
             msg += "\n⚠ " + "\n⚠ ".join(warnings)
@@ -99,6 +106,7 @@ class VocuTTSPlugin(Star):
         umo = event.unified_msg_origin
         session = self._get_session(umo)
         session.enabled = False
+        logger.info("VocuTTS: disabled for %s", umo)
         yield event.plain_result("VocuTTS 已关闭。")
 
     @vocutts_group.command("status")
@@ -219,11 +227,13 @@ class VocuTTSPlugin(Star):
     async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
         """Intercept sent messages and follow up with TTS voice."""
         if event.get_extra(VOCUTTS_SKIP_FLAG, False):
+            logger.debug("VocuTTS: skipping (skip flag set)")
             return
 
         umo = event.unified_msg_origin
         session = self.sessions.get(umo)
         if not session or not session.enabled:
+            logger.debug("VocuTTS: skipping for %s (session inactive)", umo)
             return
 
         session.last_active = time.time()
@@ -231,9 +241,11 @@ class VocuTTSPlugin(Star):
 
         result = event.get_result()
         if not result or not result.chain:
+            logger.debug("VocuTTS: skipping for %s (empty result)", umo)
             return
 
         if any(isinstance(comp, Comp.Record) for comp in result.chain):
+            logger.debug("VocuTTS: skipping for %s (already contains voice)", umo)
             return
 
         text_parts: list[str] = []
@@ -243,6 +255,7 @@ class VocuTTSPlugin(Star):
 
         full_text = "".join(text_parts).strip()
         if not full_text:
+            logger.debug("VocuTTS: skipping for %s (no text content)", umo)
             return
 
         spoken_text, emo_switch = process_text(
@@ -251,13 +264,26 @@ class VocuTTSPlugin(Star):
             emotion_keywords=self._get_cfg("emotion_keywords", ""),
         )
         if not spoken_text:
+            logger.debug("VocuTTS: skipping for %s (text empty after processing)", umo)
             return
 
         api_key = self._get_cfg("api_key", "")
         voice_id = self._resolve_voice_id(session)
         if not api_key or not voice_id:
+            logger.warning(
+                "VocuTTS: skipping for %s (api_key=%s, voice_id=%s)",
+                umo,
+                "set" if api_key else "MISSING",
+                voice_id or "MISSING",
+            )
             return
 
+        logger.info(
+            "VocuTTS: generating voice for %s (text=%d chars, voice=%s)",
+            umo,
+            len(spoken_text),
+            voice_id,
+        )
         audio_path = await self._client.generate_voice(
             spoken_text,
             api_key=api_key,
@@ -273,17 +299,20 @@ class VocuTTSPlugin(Star):
             emo_switch=emo_switch,
         )
         if not audio_path:
+            logger.warning("VocuTTS: voice generation returned no audio for %s", umo)
             return
 
         event.set_extra(VOCUTTS_SKIP_FLAG, True)
         try:
             chain = MessageChain(chain=[Comp.Record.fromFileSystem(audio_path)])
             await event.send(chain)
+            logger.info("VocuTTS: voice message sent for %s", umo)
         except Exception:
             logger.error("VocuTTS: failed to send voice message", exc_info=True)
         finally:
             try_remove_file(audio_path)
 
     async def terminate(self) -> None:
+        logger.info("VocuTTS: shutting down (%d active sessions)", len(self.sessions))
         self.sessions.clear()
         await self._client.close()
